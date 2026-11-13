@@ -1,0 +1,10 @@
+telethon
+apscheduler
+aiohttp
+qrcode[pil]
+Pillow
+pytz
+psutil
+matplotlib
+
+aiohttp-socks
