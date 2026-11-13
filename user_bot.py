@@ -31,7 +31,24 @@ from vault_core import (
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
-USER_BOT_TOKEN = os.environ.get("USER_BOT_TOKEN") or os.environ.get("BOT_TOKEN_3", "")
+try:
+    import userbot_store
+    userbot_store.init()
+except Exception:
+    userbot_store = None
+
+def _load_user_bot_token():
+    env = (os.environ.get("USER_BOT_TOKEN") or os.environ.get("BOT_TOKEN_3") or "").strip()
+    if env:
+        return env
+    if userbot_store:
+        try:
+            return (userbot_store.get_token() or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+USER_BOT_TOKEN = _load_user_bot_token()
 VERSION = "1.2.0"
 
 XRAY_DISCLAIMER = (
@@ -497,6 +514,13 @@ async def deliver(event, country: str, proto: str, use_xray: bool):
 
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def on_start(event):
+    try:
+        if userbot_store:
+            u = await event.get_sender()
+            userbot_store.touch_user(event.sender_id, getattr(u, "username", "") or "")
+    except Exception:
+        pass
+
     if not await ensure_access(event):
         return
     uid = event.sender_id

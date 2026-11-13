@@ -20,7 +20,6 @@ import base64
 import json
 import random
 import logging
-import threading
 import hashlib
 from datetime import datetime, timedelta, time as dt_time
 import pytz
@@ -105,21 +104,14 @@ except Exception:
 # --- CONFIGURATION ---
 # Values are loaded from Environment Variables (recommended for Railway).
 # Fallback values are provided for local testing.
-def _require_env(name: str) -> str:
-    val = (os.environ.get(name) or "").strip()
-    if not val:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return val
-
-# Secrets and identity — ONLY from environment (no hardcoded defaults)
-API_ID = int(_require_env("API_ID"))
-API_HASH = _require_env("API_HASH")
-ADMIN_USER_ID = int(_require_env("ADMIN_USER_ID"))
-BOT_TOKEN = _require_env("BOT_TOKEN")
-BOT_TOKEN_2 = os.environ.get("BOT_TOKEN_2", "").strip()  # optional second bot
-SELF_SESSION_STRING = _require_env("SELF_SESSION_STRING")
-IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "").strip()  # optional
-WEB_SECRET_PATH = os.environ.get("WEB_SECRET_PATH", "phoenix").strip() or "phoenix"
+API_ID = int(os.environ.get("API_ID", "28137320"))
+API_HASH = os.environ.get("API_HASH", "fd3379ea20aa8b8826a8badf8fa18a3d")
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "6271667194"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7376590621:AAGB1KxqLJCosbpg6mwIi_zfLFjKpYYYIcQ")
+BOT_TOKEN_2 = os.environ.get("BOT_TOKEN_2", "5930432125:AAFxbSwjzkq1LM6Y_URciVKvDYpKiKhBZ-c")
+SELF_SESSION_STRING = os.environ.get("SELF_SESSION_STRING", "1BJWap1sBu3MX073pRMY67aAEcRMBdYLHVULxUKOrwO-8FXLUGBE1AAx--uQhRzy5c1eqvXAPabkk639-jeiZdK05kqrGXN9-hyiH2yEcFjh_esbLDkG7iMEODVM796qa24twM5OKUwIT1t8AHKySV6kVThJzSKvB_EFgoHKhbZOR0_zaWDogfswkFmnLd1c37X1RTNdLIe5OwLdA4xnKYDxhvELXKJ4dYNEF3CuklyabEQ_BSx5cOpCCosk-5AOMjLZYcWP8y51Fh4H_xIW_q7LS85wLGrV9DtpXF66H8ma22ELUNmi1aIZx5AXRKNJmyXiSmSXSyQJ4HFVTarw21JxF5Cxcj3w=")
+IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN", "1fc06ca18c27f1")
+WEB_SECRET_PATH = os.environ.get("WEB_SECRET_PATH", "phoenix")  # used in URL: /phoenix/latest_configs.txt
 # --- END CONFIGURATION ---
 
 # --- ثابت‌ها ---
@@ -680,107 +672,19 @@ def get_text(key, lang='fa'):
 # =================================================================================
 # بخش مدیریت پایگاه داده (SQLite)
 # =================================================================================
-_db_malformed_logged = False
-_db_lock = threading.Lock()
-
-def _db_connect():
-    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
-    try:
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=NORMAL')
-        conn.execute('PRAGMA busy_timeout=30000')
-        conn.execute('PRAGMA foreign_keys=ON')
-    except Exception:
-        pass
-    return conn
-
 def db_execute(query, params=(), fetch=None):
-    global _db_malformed_logged
     try:
-        with _db_lock:
-            with _db_connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute(query, params)
-                if fetch == 'one':
-                    return cursor.fetchone()
-                if fetch == 'all':
-                    return cursor.fetchall()
-                conn.commit()
-                return cursor.lastrowid
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            if fetch == 'one': return cursor.fetchone()
+            if fetch == 'all': return cursor.fetchall()
+            conn.commit()
+            return cursor.lastrowid
     except sqlite3.Error as e:
-        msg = str(e)
-        if 'duplicate column name' in msg:
-            return None
-        if 'malformed' in msg.lower() or 'corrupt' in msg.lower():
-            if not _db_malformed_logged:
-                _db_malformed_logged = True
-                logging.error(f"❌ [DATABASE ERROR] {e} (further identical errors suppressed until restart)")
-        else:
+        if 'duplicate column name' not in str(e):
             logging.error(f"❌ [DATABASE ERROR] {e}")
         return None
-
-def db_integrity_ok() -> bool:
-    try:
-        with _db_connect() as conn:
-            row = conn.execute('PRAGMA integrity_check').fetchone()
-            return bool(row and row[0] == 'ok')
-    except Exception:
-        return False
-
-def db_try_recover():
-    """Best-effort recover of a malformed sqlite file into DB_FILE."""
-    global _db_malformed_logged
-    import subprocess, shutil, time
-    if db_integrity_ok():
-        return True
-    bak = f"{DB_FILE}.malformed_{int(time.time())}"
-    try:
-        shutil.copy2(DB_FILE, bak)
-        logging.warning(f"DB backup before recover: {bak}")
-    except Exception as e:
-        logging.error(f"DB backup failed: {e}")
-    recovered = f"{DB_FILE}.recovered"
-    try:
-        if os.path.exists(recovered):
-            os.remove(recovered)
-        # Prefer sqlite3 CLI if available
-        r = subprocess.run(
-            ['sqlite3', DB_FILE, '.recover'],
-            capture_output=True, text=True, timeout=120
-        )
-        if r.returncode == 0 and r.stdout:
-            with open(recovered, 'w', encoding='utf-8', errors='ignore') as f:
-                # pipe via python sqlite
-                pass
-            # Write recovered SQL into new db
-            conn = sqlite3.connect(recovered)
-            try:
-                conn.executescript(r.stdout)
-                conn.commit()
-            finally:
-                conn.close()
-            if Path(recovered).stat().st_size > 1000:
-                shutil.move(recovered, DB_FILE)
-                _db_malformed_logged = False
-                logging.info("✅ DB recovered via sqlite3 .recover")
-                return db_integrity_ok()
-    except FileNotFoundError:
-        logging.warning("sqlite3 CLI not found — trying Python dump recover")
-    except Exception as e:
-        logging.error(f"sqlite3 recover failed: {e}")
-    # Python fallback: copy what we can table by table is hard on corrupt db;
-    # at least recreate empty schema so bot can run
-    try:
-        if not db_integrity_ok():
-            empty = f"{DB_FILE}.empty"
-            if os.path.exists(empty):
-                os.remove(empty)
-            # keep backup; user can restore
-            logging.error("❌ DB still malformed. Restore a healthy backup into /data/bot_data.db")
-            return False
-    except Exception as e:
-        logging.error(f"db_try_recover fallback: {e}")
-    return False
 
 def db_init():
     db_execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
@@ -803,10 +707,6 @@ def db_init():
     for tbl in ('source_channels', 'source_txt_channels'):
         try:
             db_execute(f'ALTER TABLE {tbl} ADD COLUMN title TEXT')
-        except Exception:
-            pass
-        try:
-            db_execute(f'ALTER TABLE {tbl} ADD COLUMN username TEXT')
         except Exception:
             pass
 
@@ -907,33 +807,22 @@ _auto_rejoin_state = {
 }
 
 
-def save_source_channel(channel_id, title=None, table='source_channels', username=None):
-    """Insert/update a source with optional human title and username."""
+def save_source_channel(channel_id, title=None, table='source_channels'):
+    """Insert/update a source with optional human title."""
     try:
         cid = int(channel_id)
-        if title and username:
-            db_execute(
-                f"INSERT INTO {table} (channel_id, title, username) VALUES (?, ?, ?) "
-                f"ON CONFLICT(channel_id) DO UPDATE SET title=excluded.title, username=excluded.username",
-                (cid, title, username)
-            )
-        elif title:
-            db_execute(
-                f"INSERT INTO {table} (channel_id, title) VALUES (?, ?) "
-                f"ON CONFLICT(channel_id) DO UPDATE SET title=excluded.title",
-                (cid, title)
-            )
-        else:
-            db_execute(f"INSERT OR IGNORE INTO {table} (channel_id) VALUES (?)", (cid,))
-        _source_title_cache[cid] = title or _source_title_cache.get(cid)
-    except Exception as e:
-        logging.warning(f"save_source_channel: {e}")
-        try:
-            db_execute(f"INSERT OR IGNORE INTO {table} (channel_id) VALUES (?)", (int(channel_id),))
-        except Exception:
-            pass
-
-
+    except Exception:
+        return
+    title = (title or '').strip() or None
+    if title:
+        db_execute(
+            f"INSERT INTO {table} (channel_id, title) VALUES (?, ?) "
+            f"ON CONFLICT(channel_id) DO UPDATE SET title=excluded.title",
+            (cid, title),
+        )
+        _source_title_cache[cid] = title
+    else:
+        db_execute(f"INSERT OR IGNORE INTO {table} (channel_id) VALUES (?)", (cid,))
 
 def get_source_label(source_id) -> str:
     """Human-readable source name for logs. Accepts int id or existing label string."""
@@ -1195,20 +1084,10 @@ def parse_config(link):
             identifier = f"{host}:{port}"
             return host, port, "ss", identifier
 
-        elif "t.me/proxy" in link or "t.me/s" in link or "t.me/webproxy" in link or "t.me/socks" in link:
-            from urllib.parse import unquote
+        elif "t.me/proxy" in link or "t.me/s" in link:
             query = parse_qs(urlparse(link).query)
             server = query.get("server", [None])[0]
-            if server:
-                server = unquote(server)
-                # webproxy sometimes encodes path in server: host/path
-                if "/" in server and not server.replace(".", "").replace(":", "").isdigit():
-                    server = server.split("/")[0]
-            port_s = query.get("port", [None])[0]
-            try:
-                port = int(port_s) if port_s else (443 if "webproxy" in link else 0)
-            except Exception:
-                port = 443 if "webproxy" in link else 0
+            port = int(query.get("port", [0])[0])
             return server, port, "telegram proxy", server
     except Exception as e:
         logging.warning(f"⚠️ [PARSE ERROR] {link[:30]}... | {e}")
@@ -1540,7 +1419,7 @@ def extract_configs_from_text(content: str):
         # bare ss:// with spaces stripped
         if line.startswith(("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")):
             found.add(line.split()[0])
-        if "t.me/proxy?" in line or "t.me/s?" in line or "t.me/webproxy?" in line or "t.me/socks?" in line:
+        if "t.me/proxy?" in line or "t.me/s?" in line:
             found.update(re.findall(PROXY_REGEX, line))
     # whole-file base64 subscription
     stripped = "".join(content.split())
@@ -1632,7 +1511,7 @@ async def extract_links_from_message(message):
                 url = _normalize_config_text(url)
                 if url and (
                     any(url.startswith(p) for p in ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://"))
-                    or "t.me/proxy" in url or "t.me/webproxy" in url or "t.me/socks" in url
+                    or "t.me/proxy" in url
                     or "t.me/s?" in url
                 ):
                     links.add(url)
@@ -1847,7 +1726,7 @@ def register_bot_handlers():
             await edit_panel(get_sender_menu_layout)
             return
 
-        if data in ('set_sub_max_configs', 'set_sub_meta_add', 'set_mahsa_ads', 'set_github_token', 'set_github_owner', 'set_github_repo', 'set_github_interval', 'set_github_hours', 'set_mahsa_exclude_countries', 'set_mahsa_exclude_protocols', 'add_source', 'add_sub_source', 'add_source_bulk', 'set_footer', 'set_naming_template', 'set_sleep_time', 'set_target', 'config_tester', 'set_slow_mode_delay', 'set_send_min_interval', 'set_prune_threshold', 'set_country_filter_list', 'set_isp_filter_list', 'set_dedupe_time', 'set_ping_filter', 'import_full_backup', 'manual_process', 'set_live_stats_interval', 'add_txt_source', 'set_dedupe_exception_list', 'set_connectivity_exception_list', 'npvt_admin_test'):
+        if data in ('set_sub_max_configs', 'set_sub_meta_add', 'set_mahsa_ads', 'set_github_token', 'set_github_owner', 'set_github_repo', 'set_github_interval', 'set_github_hours', 'set_mahsa_exclude_countries', 'set_mahsa_exclude_protocols', 'add_source', 'add_sub_source', 'add_source_bulk', 'set_footer', 'set_naming_template', 'set_sleep_time', 'set_target', 'config_tester', 'set_slow_mode_delay', 'set_send_min_interval', 'set_prune_threshold', 'set_country_filter_list', 'set_isp_filter_list', 'set_dedupe_time', 'set_ping_filter', 'import_full_backup', 'manual_process', 'set_live_stats_interval', 'add_txt_source', 'set_dedupe_exception_list', 'set_connectivity_exception_list', 'npvt_admin_test', 'userbot_set_token', 'userbot_add_admin', 'userbot_set_webhook'):
             await handle_conversation(event, data)
             return
 
@@ -1889,6 +1768,46 @@ def register_bot_handlers():
             set_setting('mahsa_fail_count', '0')
             set_setting('mahsa_skip_count', '0')
             return await edit_panel(get_mahsa_menu_layout)
+
+        elif data == 'userbot_panel':
+            try:
+                import userbot_store
+                userbot_store.init()
+                text = userbot_store.status_text()
+            except Exception as e:
+                text = f"🤖 ربات سوم\n\nخطا: `{e}`"
+            buttons = [
+                [Button.inline("🔄 بروزرسانی", "userbot_panel")],
+                [Button.inline("🔑 توکن + Webhook", "userbot_set_token"), Button.inline("🛡 افزودن ادمین", "userbot_add_admin")],
+                [Button.inline("🌐 فقط Webhook", "userbot_set_webhook"), Button.inline("⚡ Webhook پیشنهادی", "userbot_webhook_suggested")],
+                [Button.inline("▶️ اعمال Webhook", "userbot_apply_webhook"), Button.inline("❌ حذف Webhook", "userbot_del_webhook")],
+                [Button.inline("🔙 بازگشت", "system_menu")],
+            ]
+            await event.edit(text, buttons=buttons, parse_mode='md')
+            return
+        elif data in ('userbot_set_token', 'userbot_add_admin', 'userbot_set_webhook'):
+            await handle_conversation(event, data)
+            return
+        elif data == 'userbot_del_webhook':
+            try:
+                import userbot_store
+                userbot_store.set_webhook_url('')
+                res = userbot_store.apply_webhook()
+                msg = f"✅ Webhook پاک شد.\n`{res}`"
+            except Exception as e:
+                msg = f"❌ `{e}`"
+            await event.edit(msg, buttons=[[Button.inline("🔙 بازگشت", "userbot_panel")]], parse_mode='md')
+            return
+        elif data == 'userbot_apply_webhook':
+            try:
+                import userbot_store
+                res = userbot_store.apply_webhook()
+                msg = f"▶️ نتیجه:\n`{res}`"
+            except Exception as e:
+                msg = f"❌ `{e}`"
+            await event.edit(msg, buttons=[[Button.inline("🔙 بازگشت", "userbot_panel")]], parse_mode='md')
+            return
+
         elif data == 'health_check':
             await bot.edit_message(event.chat_id, event.message_id, "🩺 در حال بررسی سلامت ربات...")
             report_text, report_buttons = await run_health_check()
@@ -1896,9 +1815,6 @@ def register_bot_handlers():
         elif data == 'test_all_sources':
             await event.answer("🧪 شروع تست منابع...")
             await test_all_sources(event)
-        elif data == 'export_sources_backup':
-            await event.answer("💾 در حال تهیه بکاپ منابع...")
-            await export_sources_backup(event)
         elif data == 'auto_rejoin_menu':
             return await edit_panel(get_auto_rejoin_menu_layout)
         elif data == 'auto_rejoin_start':
@@ -2258,6 +2174,7 @@ async def get_system_menu_layout():
                [Button.inline("🩺 بررسی سلامت", "health_check"), Button.inline("📋 آمار صف", "queue_stats_menu")],
                [Button.inline("🧪 تست کانفیگ", "config_tester"), Button.inline(get_text('button_manual_process', 'fa'), "manual_process")],
                [Button.inline("🔑 مدیریت نشست", "session_management"), Button.inline("♻️ ریستارت ربات", "ask_restart_bot")],
+               [Button.inline("🤖 ربات سوم (کاربری)", "userbot_panel")],
                [Button.inline(get_text('button_back_main', 'fa'), "main_menu")]]
     return text, buttons
 
@@ -2411,7 +2328,6 @@ async def get_text_sources_menu_layout():
         [Button.inline(get_text('button_add_text_source', 'fa'), "add_source"), Button.inline("➕ افزودن لیستی", "add_source_bulk")],
         [Button.inline(get_text('button_remove_text_source', 'fa'), "remove_source_list")],
         [Button.inline("🧪 تست همه منابع", "test_all_sources")],
-        [Button.inline("💾 بکاپ منابع (ID+یوزرنیم)", "export_sources_backup")],
         [Button.inline("🔄 عضویت مجدد خودکار", "auto_rejoin_menu")],
         [Button.inline("🧹 پاکسازی منابع ضعیف", "prune_sources_menu")],
         [Button.inline(get_text('button_back_sources_menu', 'fa'), "sources_menu")]
@@ -2790,7 +2706,7 @@ async def get_npvt_menu_layout():
         f"**وضعیت ماژول:** {avail}\n"
         f"**وضعیت قابلیت:** {status}\n"
         f"**گزارش به ادمین:** {report_status}\n\n"
-        f"وقتی فعال باشد، فایل‌های `.npvt` / `.npvs` دریافت‌شده از منابع دیکریپت شده و کانفیگ‌های V2Ray استخراج می‌شوند."
+        f"وقتی فعال باشد، فایل‌های `.npvt` دریافت‌شده از منابع دیکریپت شده و کانفیگ‌های V2Ray استخراج می‌شوند."
     )
     buttons = [
         [Button.inline("🔴 خاموش کردن" if enabled else "🟢 روشن کردن", "toggle_npvt_decrypt")],
@@ -3274,6 +3190,9 @@ async def handle_conversation(event, conv_type):
         'set_mahsa_exclude_countries': ("کد کشورهای استثنا برای مهسا را با کاما بفرست." + chr(10)+ "مثال: IR,CN" + chr(10)+ "برای پاک کردن: خالی" + chr(10)+ f"فعلی: `{get_setting('mahsa_exclude_countries', '') or '(خالی)'}`"),
         'set_mahsa_exclude_protocols': ("پروتکل‌های استثنا برای مهسا را با کاما بفرست." + chr(10)+ "مثال: vmess,ss" + chr(10)+ "مجاز: vless,vmess,trojan,ss" + chr(10)+ "برای پاک کردن: خالی" + chr(10)+ f"فعلی: `{get_setting('mahsa_exclude_protocols', '') or '(خالی)'}`"),
 
+        'userbot_set_token': "🔑 توکن ربات سوم (BotFather) را بفرستید. در userbot_meta.db ذخیره می‌شود و با ریستور bot_data.db پاک نمی‌شود.\nلغو: /cancel",
+        'userbot_add_admin': "🛡 آیدی عددی تلگرام ادمین ربات سوم را بفرستید.\nلغو: /cancel",
+        'userbot_set_webhook': "🌐 URL وب‌هوک را بفرستید (یا کلمه خالی برای حذف).\nلغو: /cancel",
         'npvt_admin_test': "یک فایل `.npvt` ارسال کنید تا دیکریپت و استخراج کانفیگ‌ها فقط برای شما (ادمین) انجام شود. به کانال مقصد ارسال نمی‌شود.",
         'import_full_backup': "فایل `bot_data.db` را برای بازگردانی کامل ربات ارسال کنید. ربات پس از این عملیات ریستارت خواهد شد.",
         'set_isp_filter_list': ("نام ISPها را با کاما بفرست (مسدودسازی جزئی)." + chr(10)+ "مثال: Cloudflare, DigitalOcean, OVH, Hetzner" + chr(10)+ f"لیست فعلی: `{get_setting('isp_filter_list', '') or 'خالی'}`"),
@@ -3289,6 +3208,51 @@ async def handle_conversation(event, conv_type):
             await conv.send_message(prompts[conv_type], buttons=Button.clear())
             response = await conv.get_response()
             if response.text and response.text.lower() == '/cancel': return await conv.send_message("عملیات لغو شد.")
+
+            if conv_type == 'userbot_set_token':
+                import userbot_store
+                tok = (response.text or '').strip()
+                if len(tok) < 30 or ':' not in tok:
+                    return await conv.send_message('❌ توکن نامعتبر به نظر می‌رسد.')
+                userbot_store.set_token(tok)
+                os.environ['USER_BOT_TOKEN'] = tok
+                await conv.send_message('✅ توکن ذخیره شد در userbot_meta.db')
+                sug = userbot_store.suggest_webhook_url()
+                tip = (f"\nپیشنهاد سرور: `{sug}`" if sug else "\nاگر دامنه عمومی داری همان را بفرست (https://...).")
+                await conv.send_message(
+                    "🌐 حالا **آدرس Webhook** را بفرست." + tip + "\n"
+                    "اگر webhook نمی‌خواهی بفرست: `خالی`\n"
+                    "برای استفاده از پیشنهاد بفرست: `پیشنهاد`\nلغو: /cancel"
+                )
+                response2 = await conv.get_response()
+                if response2.text and response2.text.lower() == '/cancel':
+                    return await conv.send_message('توکن ذخیره شد؛ تنظیم webhook لغو شد.')
+                url = (response2.text or '').strip()
+                if url in ('خالی', 'empty', '-', 'none', 'None', '0'):
+                    url = ''
+                elif url in ('پیشنهاد', 'suggested', 'auto') and sug:
+                    url = sug
+                userbot_store.set_webhook_url(url)
+                res = userbot_store.apply_webhook()
+                if url:
+                    return await conv.send_message(f'✅ Webhook ست و اعمال شد:\n`{url}`\nAPI: `{res}`\nیک‌بار ریستارت برای user_bot توصیه می‌شود.')
+                return await conv.send_message(f'✅ توکن ذخیره شد؛ webhook خالی (polling).\nAPI: `{res}`')
+            if conv_type == 'userbot_add_admin':
+                import userbot_store
+                raw = (response.text or '').strip()
+                if not raw.isdigit():
+                    return await conv.send_message('❌ فقط آیدی عددی بفرستید.')
+                userbot_store.add_admin(int(raw))
+                return await conv.send_message(f'✅ ادمین `{raw}` اضافه شد.')
+            if conv_type == 'userbot_set_webhook':
+                import userbot_store
+                url = (response.text or '').strip()
+                if url in ('خالی', 'empty', '-', 'none', 'None'):
+                    url = ''
+                userbot_store.set_webhook_url(url)
+                res = userbot_store.apply_webhook()
+                return await conv.send_message(f'✅ Webhook ذخیره/اعمال شد.\n`{res}`')
+
 
             if conv_type == 'set_mahsa_ads':
                 val = (response.text or '').strip()
@@ -3334,8 +3298,8 @@ async def handle_conversation(event, conv_type):
 
                 if not NPVT_AVAILABLE:
                     return await conv.send_message("❌ ماژول NPVT در دسترس نیست.")
-                if not (response.media and response.file and response.file.name and (response.file.name.lower().endswith('.npvt') or response.file.name.lower().endswith('.npvs'))):
-                    return await conv.send_message("❌ لطفاً فقط یک فایل با پسوند `.npvt` یا `.npvs` ارسال کنید.")
+                if not (response.media and response.file and response.file.name and response.file.name.lower().endswith(('.npvt','.npvs'))):
+                    return await conv.send_message("❌ لطفاً فقط یک فایل با پسوند `.npvt` ارسال کنید.")
                 await conv.send_message("⏳ در حال دیکریپت فایل NPVT...")
                 # Re-use the same processor in admin_test mode
                 await process_npvt_file_from_channel(response, admin_test=True)
@@ -3423,11 +3387,11 @@ async def handle_conversation(event, conv_type):
                     entity = await client.get_entity(entity_ref)
                     if conv_type == 'add_source':
                         await client(JoinChannelRequest(entity))
-                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_channels', getattr(entity, 'username', None))
+                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_channels')
                         await conv.send_message(f"✅ منبع متنی `{entity.title}` اضافه شد.\nID: `{get_peer_id(entity)}`")
                     elif conv_type == 'add_txt_source':
                         await client(JoinChannelRequest(entity))
-                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_txt_channels', getattr(entity, 'username', None))
+                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_txt_channels')
                         await conv.send_message(f"✅ منبع فایل `{entity.title}` اضافه شد.\nID: `{get_peer_id(entity)}`")
                     else:
                         set_setting('target_channel', get_peer_id(entity))
@@ -3454,7 +3418,7 @@ async def handle_conversation(event, conv_type):
                     try:
                         entity = await client.get_entity(link)
                         await client(JoinChannelRequest(entity))
-                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_channels', getattr(entity, 'username', None))
+                        save_source_channel(get_peer_id(entity), getattr(entity, 'title', None), 'source_channels')
                         s += 1
                     except Exception as ex: f.append(f"`{link}`: `{ex}`")
                     await asyncio.sleep(1)
@@ -3637,7 +3601,7 @@ async def process_message_from_channel(message):
                 and getattr(message, "media", None)
                 and message.file
                 and message.file.name
-                and (message.file.name.lower().endswith('.npvt') or message.file.name.lower().endswith('.npvs'))
+                and message.file.name.lower().endswith(('.npvt', '.npvs'))
             )
         except Exception:
             has_npvt = False
@@ -4748,72 +4712,6 @@ async def start_auto_rejoin(chat_id: int):
     return True, "شروع شد"
 
 
-
-async def export_sources_backup(event):
-    """Export text+file sources with id, title, username to a txt file."""
-    rows_t = db_execute("SELECT channel_id, title, username FROM source_channels", fetch='all') or []
-    rows_f = db_execute("SELECT channel_id, title, username FROM source_txt_channels", fetch='all') or []
-    # backward compat if username column missing in selected rows
-    def norm(rows):
-        out = []
-        for r in rows:
-            if len(r) >= 3:
-                out.append((r[0], r[1], r[2]))
-            elif len(r) == 2:
-                out.append((r[0], r[1], None))
-            else:
-                out.append((r[0], None, None))
-        return out
-    # if query failed due to no username column, fallback
-    if not rows_t:
-        rows_t = db_execute("SELECT channel_id, title FROM source_channels", fetch='all') or []
-    if not rows_f:
-        rows_f = db_execute("SELECT channel_id, title FROM source_txt_channels", fetch='all') or []
-    rows_t, rows_f = norm(rows_t), norm(rows_f)
-
-    lines = ["# sources backup", f"# generated: {datetime.now().isoformat()}", "# kind\tid\tusername\ttitle\tinvite_hint", ""]
-    async def enrich(cid, title, username, kind):
-        uname = username or ""
-        live_title = title or ""
-        try:
-            ent = await client.get_entity(int(cid))
-            live_title = getattr(ent, 'title', None) or live_title
-            uname = getattr(ent, 'username', None) or uname
-            if uname:
-                try:
-                    db_execute(
-                        f"UPDATE {('source_channels' if kind=='text' else 'source_txt_channels')} SET title=?, username=? WHERE channel_id=?",
-                        (live_title, uname, int(cid))
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        short = str(cid)
-        if short.startswith('-100'):
-            short = short[4:]
-        hint = f"https://t.me/{uname}" if uname else f"https://t.me/c/{short}/1"
-        uname_disp = f"@{uname}" if uname else "-"
-        return f"{kind}\t{cid}\t{uname_disp}\t{live_title}\t{hint}"
-
-    for cid, title, username in rows_t:
-        lines.append(await enrich(cid, title, username, 'text'))
-    for cid, title, username in rows_f:
-        lines.append(await enrich(cid, title, username, 'file'))
-
-    path = f"/tmp/sources_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(lines) + "\n")
-    await bot.send_file(
-        event.chat_id,
-        path,
-        caption=f"💾 بکاپ منابع\nمتنی: {len(rows_t)} · فایلی: {len(rows_f)}"
-    )
-    try:
-        os.remove(path)
-    except Exception:
-        pass
-
 async def test_all_sources(event):
     """Probe every text source: membership + recent messages + link count."""
     rows = db_execute("SELECT channel_id, title FROM source_channels", fetch='all') or []
@@ -4830,7 +4728,6 @@ async def test_all_sources(event):
     )
     lines = ["🧪 **نتیجه تست منابع متنی**\n"]
     ok_n = fail_n = 0
-    ok_entries, fail_entries = [], []
     for cid, title in rows:
         label = title or get_source_label(cid)
         try:
@@ -4864,14 +4761,12 @@ async def test_all_sources(event):
                 line += "\n   ⚠️ پیام‌ها بدون متن قابل‌استخراج (شاید فقط رسانه/فوروارد خالی)"
             lines.append(line)
             ok_n += 1
-            ok_entries.append(f"{live_title}\t{cid}\tmsgs={msg_count}\tlinks={link_count}")
             logging.info(
                 f"[SOURCE TEST] OK {live_title} ({cid}) msgs={msg_count} links={link_count} chars={text_chars}"
             )
         except Exception as e:
             lines.append(f"❌ **{label}**\n   ID: `{cid}` · خطا: `{e}`")
             fail_n += 1
-            fail_entries.append(f"{label}\t{cid}\t{e}")
             logging.warning(f"[SOURCE TEST] FAIL {label} ({cid}): {e}")
         await asyncio.sleep(0.4)
 
@@ -4885,28 +4780,6 @@ async def test_all_sources(event):
         await bot.edit_message(event.chat_id, status_msg.id, text[:4000])
     except Exception:
         await bot.send_message(event.chat_id, text[:4000])
-
-    # Export OK / FAIL lists as text files for admin
-    try:
-        import tempfile
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        ok_body = "name\tid\tinfo\n" + "\n".join(ok_entries) + ("\n" if ok_entries else "")
-        fail_body = "name\tid\terror\n" + "\n".join(fail_entries) + ("\n" if fail_entries else "")
-        ok_path = f"/tmp/sources_ok_{ts}.txt"
-        fail_path = f"/tmp/sources_fail_{ts}.txt"
-        with open(ok_path, 'w', encoding='utf-8') as f:
-            f.write(ok_body)
-        with open(fail_path, 'w', encoding='utf-8') as f:
-            f.write(fail_body)
-        await bot.send_file(event.chat_id, ok_path, caption=f"✅ منابع سالم: {ok_n}")
-        await bot.send_file(event.chat_id, fail_path, caption=f"❌ منابع مشکل‌دار: {fail_n}")
-        try:
-            os.remove(ok_path)
-            os.remove(fail_path)
-        except Exception:
-            pass
-    except Exception as ex:
-        logging.warning(f"source test file export: {ex}")
 
 
 async def prune_inactive_sources(event):

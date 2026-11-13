@@ -450,62 +450,181 @@ def _walk_json_for_uris(obj, found: list):
         found.extend(_extract_uris_from_text(obj))
 
 
+def _try_pantegnos_external(file_bytes: bytes) -> dict:
+    """Optional: call Pantegnos CLI if PANTEGNOS_BIN is set (supports NPVS Gen-2)."""
+    import os, subprocess, tempfile, shutil
+    result = {"success": False, "uris": [], "raw_json": None, "error": None}
+    candidates = []
+    env_bin = os.environ.get("PANTEGNOS_BIN", "").strip()
+    if env_bin:
+        candidates.append(env_bin)
+    for c in ("/data/pantegnos", "/app/pantegnos", "/usr/local/bin/pantegnos", "pantegnos"):
+        candidates.append(c)
+    bin_path = ""
+    for c in candidates:
+        if not c:
+            continue
+        if os.path.sep in c or c.startswith('.'):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                bin_path = c
+                break
+        else:
+            found = shutil.which(c)
+            if found:
+                bin_path = found
+                break
+    if not bin_path:
+        result["error"] = "Pantegnos binary not found (set PANTEGNOS_BIN or place at /data/pantegnos)"
+        return result
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            inp = os.path.join(td, "in.npvs")
+            with open(inp, "wb") as f:
+                f.write(file_bytes)
+            # Common CLI shapes: pantegnos decrypt <file>  OR  pantegnos <file>
+            cmd_candidates = [
+                [bin_path, "decrypt", inp],
+                [bin_path, inp],
+                [bin_path, "-f", inp],
+            ]
+            out = ""
+            last_err = ""
+            for cmd in cmd_candidates:
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, timeout=30)
+                    out = (proc.stdout or b"").decode("utf-8", errors="ignore")
+                    err = (proc.stderr or b"").decode("utf-8", errors="ignore")
+                    if proc.returncode == 0 and out.strip():
+                        break
+                    last_err = err or out or f"exit {proc.returncode}"
+                except Exception as e:
+                    last_err = str(e)
+            uris = _extract_uris_from_text(out)
+            if uris:
+                result["success"] = True
+                result["uris"] = list(dict.fromkeys(uris))
+                result["raw_json"] = {"source": "pantegnos", "preview": out[:2000]}
+                return result
+            result["error"] = f"Pantegnos produced no URIs: {last_err[:300]}"
+            return result
+    except Exception as e:
+        result["error"] = f"Pantegnos error: {e}"
+        return result
+
+
+def _decrypt_npvt_legacy_text(raw_content: str) -> dict:
+    result = {"success": False, "uris": [], "raw_json": None, "error": None}
+    if raw_content.startswith("NPVTSUB1"):
+        raw_content = raw_content[8:].strip()
+    elif raw_content.startswith("NPVT1"):
+        raw_content = raw_content[5:].strip()
+    elif raw_content.startswith("NPVS1") or raw_content.startswith("NPVSSUB1"):
+        # Some channels still ship text-like NPVS1 with same whitebox payload
+        if raw_content.startswith("NPVSSUB1"):
+            raw_content = raw_content[9:].strip()
+        else:
+            raw_content = raw_content[5:].strip()
+
+    if not raw_content:
+        result["error"] = "Empty content after stripping header"
+        return result
+
+    # Open / plaintext containers
+    plain_uris = _extract_uris_from_text(raw_content)
+    if plain_uris and ("vless://" in raw_content or "vmess://" in raw_content or "trojan://" in raw_content):
+        # If mostly plain links, accept without whitebox
+        if "NPVT" not in raw_content[:20] and len(plain_uris) >= 1 and "," not in raw_content[:80]:
+            result["success"] = True
+            result["uris"] = list(dict.fromkeys(plain_uris))
+            return result
+
+    p2, p3, p4, p5 = load_whitebox_state()
+    payloads = [p.strip() for p in raw_content.split(",") if p.strip()]
+    if len(payloads) < 2:
+        payloads = [None, raw_content]
+
+    decrypted_str = decrypt_logic(payloads[1], p2, p3, p4, p5)
+    if not decrypted_str:
+        result["error"] = "Decryption failed (invalid payload or outdated whitebox tables)"
+        return result
+
+    uris = []
+    raw_json = None
+    try:
+        raw_json = json.loads(decrypted_str)
+        _walk_json_for_uris(raw_json, uris)
+    except Exception:
+        uris = _extract_uris_from_text(decrypted_str)
+        raw_json = {"raw_data": decrypted_str[:2000]}
+
+    uris = list(dict.fromkeys([u for u in uris if u]))
+    result["success"] = True
+    result["uris"] = uris
+    result["raw_json"] = raw_json
+    if not uris:
+        result["error"] = "Decrypted OK but no V2Ray URIs found inside"
+    return result
+
+
 def decrypt_npvt(file_bytes: bytes) -> dict:
     """
-    Decrypt an NPVT payload and extract V2Ray config links.
+    Decrypt NPVT / NPVS payloads and extract V2Ray config links.
 
-    Returns dict:
-        success (bool), uris (list[str]), raw_json (any|None), error (str|None)
+    Order:
+      1) Plain URI scrape (any bytes)
+      2) Legacy NPVT1 / NPVTSUB1 / text NPVS1 whitebox
+      3) Binary NPVS Gen-2 via optional PANTEGNOS_BIN
     """
     result = {"success": False, "uris": [], "raw_json": None, "error": None}
     try:
+        if not file_bytes:
+            result["error"] = "Empty file"
+            return result
+
+        # 1) Always try plain URI extraction first (some .npvs are misnamed plain lists)
+        plain = _extract_uris_from_text(file_bytes.decode("utf-8", errors="ignore"))
+        if plain and len(plain) >= 1 and file_bytes[:4] not in (b"NPVS", b"NPVT"):
+            # only accept pure-ish plain if no binary magic
+            if b"vless://" in file_bytes or b"vmess://" in file_bytes or b"trojan://" in file_bytes:
+                result["success"] = True
+                result["uris"] = list(dict.fromkeys(plain))
+                result["raw_json"] = {"source": "plain"}
+                return result
+
+        # 2) Text/legacy whitebox path
         raw_content = file_bytes.decode("utf-8", errors="ignore").strip()
+        is_bin_npvs = file_bytes[:4] == b"NPVS" or (len(file_bytes) > 8 and file_bytes[:4] == b"NPVS")
+        looks_text_npvt = raw_content.startswith(("NPVT1", "NPVTSUB1", "NPVS1", "NPVSSUB1", "NPVO1"))
 
-        if raw_content.startswith("NPVTSUB1"):
-            raw_content = raw_content[8:].strip()
-        elif raw_content.startswith("NPVSSUB1"):
-            raw_content = raw_content[8:].strip()
-        elif raw_content.startswith("NPVT1"):
-            raw_content = raw_content[5:].strip()
-        elif raw_content.startswith("NPVS1"):
-            raw_content = raw_content[5:].strip()
-        elif raw_content.startswith("NPVS"):
-            # generic NPVS* header — strip first token
-            parts = raw_content.split(None, 1)
-            raw_content = parts[1].strip() if len(parts) > 1 else raw_content[4:].strip()
+        if looks_text_npvt or (not is_bin_npvs and "," in raw_content[:200]):
+            legacy = _decrypt_npvt_legacy_text(raw_content)
+            if legacy.get("success") and legacy.get("uris"):
+                return legacy
+            if legacy.get("success"):
+                result = legacy  # keep even if no uris
+            elif not is_bin_npvs:
+                result = legacy
 
-        if not raw_content:
-            result["error"] = "Empty content after stripping header"
-            return result
+        # 3) Binary NPVS → external engine if available
+        if file_bytes[:4] == b"NPVS" or (result.get("error") and "whitebox" in (result.get("error") or "")):
+            ext = _try_pantegnos_external(file_bytes)
+            if ext.get("success") and ext.get("uris"):
+                return ext
+            if not result.get("error"):
+                result["error"] = (
+                    "NPVS Gen-2 binary detected. Legacy whitebox cannot open it. "
+                    "Set PANTEGNOS_BIN to a Pantegnos CLI binary, or wait for embedded Gen-2 keys."
+                )
+            elif ext.get("error") and "not configured" not in ext["error"]:
+                result["error"] = ext["error"]
+            elif file_bytes[:4] == b"NPVS":
+                result["error"] = (
+                    "NPVS Gen-2 binary: decryption needs Pantegnos/AppKey. "
+                    "Legacy NPVT whitebox tables do not apply."
+                )
 
-        p2, p3, p4, p5 = load_whitebox_state()
-        payloads = [p.strip() for p in raw_content.split(",") if p.strip()]
-
-        if len(payloads) < 2:
-            payloads = [None, raw_content]
-
-        decrypted_str = decrypt_logic(payloads[1], p2, p3, p4, p5)
-        if not decrypted_str:
-            result["error"] = "Decryption failed (invalid payload or outdated whitebox tables)"
-            return result
-
-        uris = []
-        raw_json = None
-
-        try:
-            raw_json = json.loads(decrypted_str)
-            _walk_json_for_uris(raw_json, uris)
-        except Exception:
-            uris = _extract_uris_from_text(decrypted_str)
-            raw_json = {"raw_data": decrypted_str[:2000]}
-
-        uris = list(dict.fromkeys([u for u in uris if u]))
-
-        result["success"] = True
-        result["uris"] = uris
-        result["raw_json"] = raw_json
-        if not uris:
-            result["error"] = "Decrypted OK but no V2Ray URIs found inside"
+        if not result.get("success") and not result.get("error"):
+            result["error"] = "Unsupported or undecryptable NPVT/NPVS payload"
         return result
 
     except Exception as e:
